@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-Streaming workload collection with incremental HuggingFace push.
+Workload collection with HuggingFace push.
 
-For each batch size:
-  1. Run bench_sharegpt.py (DUMP_MAX_COUNT=500, single batch size, 2 rounds);
-     dump budget is typically exhausted in round 1, so collection is fast.
-  2. sanitize_dumps.py --max-new-workloads 4  →  append 4 diverse workloads.
-  3. Push updated JSONL + new blob safetensors to HF PR (append-only, no deletes).
-  4. rm -rf dump dir.
-
-After all batch sizes:
-  5. flashinfer-bench run --local (baseline eval, all workloads).
-  6. Push trace JSONL to HF PR  →  PR 2 complete.
+Pipeline:
+  1. Run bench_sharegpt.py once across all batch sizes against a single
+     SGLang server. FLASHINFER_DUMP_DEDUP=1 caps dumps to ~2 per unique
+     (batch_size, kv_length) shape signature, so a small DUMP_MAX_COUNT
+     budget covers every batch size without needing a per-batch restart.
+  2. sanitize_dumps.py once over the combined dump dir → diverse workloads
+     across all batch sizes.
+  3. Push JSONL + new blob safetensors to the HF PR.
+  4. flashinfer-bench run --local (baseline eval) → push trace JSONL.
 
 Usage:
     # Must be invoked under tools/gpu-lock so CUDA_VISIBLE_DEVICES is set.
@@ -32,8 +31,7 @@ Notes:
   - --extra-server-flag defaults to --disable-cuda-graph.
     Ragged prefill: add --disable-radix-cache --disable-piecewise-cuda-graph
     Paged prefill: add --enable-deterministic-inference
-  - Set --replace-first to overwrite any existing workloads on the first batch
-    size instead of appending.
+  - Set --replace to overwrite existing workloads instead of appending.
   - --no-push performs a dry run (collects and sanitizes but does not upload).
   - --no-eval skips the flashinfer-bench eval and trace upload steps.
 """
@@ -135,18 +133,19 @@ def run_inference(
     def_name: str,
     model_key: str,
     model_path: str,
-    batch_size: int,
+    batch_sizes: list,
     dump_dir: Path,
     include_pattern: str,
     num_batches: int,
     dump_max_count: int,
+    dump_max_per_key: int,
     extra_server_flags: list,
     peer_node_addr: list,
     dist_init_port: int,
     conda_env: Optional[str],
     base_url: str,
 ) -> None:
-    """Run bench_sharegpt.py for *one* batch size, collecting dumps into dump_dir."""
+    """Run bench_sharegpt.py once across all batch_sizes, collecting dumps into dump_dir."""
     cubins_dir = "/tmp/flashinfer_cubins"
     env = {
         **os.environ,
@@ -158,6 +157,8 @@ def run_inference(
         "FLASHINFER_DUMP_EXCLUDE": "*.__init__",
         "FLASHINFER_DUMP_MAX_COUNT": str(dump_max_count),
         "FLASHINFER_DUMP_MAX_SIZE_GB": "16",
+        "FLASHINFER_DUMP_DEDUP": "1",
+        "FLASHINFER_DUMP_MAX_PER_KEY": str(dump_max_per_key),
         "FLASHINFER_USE_CUDA_NORM": "1",
         "FLASHINFER_DISABLE_VERSION_CHECK": "1",
         "FLASHINFER_CUBIN_DIR": cubins_dir,
@@ -176,7 +177,7 @@ def run_inference(
         "--model-path",
         model_path,
         "--batch-sizes",
-        str(batch_size),
+        *[str(b) for b in batch_sizes],
         "--num-batches",
         str(num_batches),
         "--base-url",
@@ -192,12 +193,15 @@ def run_inference(
         cmd += ["--conda-env", conda_env]
 
     log(f"  CMD: {' '.join(cmd[:10])} ...")
-    log(f"  FLASHINFER_DUMP_DIR={dump_dir}, DUMP_MAX_COUNT={dump_max_count}")
+    log(
+        f"  FLASHINFER_DUMP_DIR={dump_dir}, DUMP_MAX_COUNT={dump_max_count}, "
+        f"DEDUP=1 (max {dump_max_per_key} per shape)"
+    )
 
     result = subprocess.run(cmd, env=env)
     if result.returncode != 0:
         raise RuntimeError(
-            f"bench_sharegpt.py exited {result.returncode} for batch_size={batch_size}"
+            f"bench_sharegpt.py exited {result.returncode} for batch_sizes={batch_sizes}"
         )
 
     n_dumps = sum(1 for _ in dump_dir.iterdir()) if dump_dir.exists() else 0
@@ -245,7 +249,7 @@ def push_to_pr(
     trace_dir: Path,
     blob_dir: Path,
     old_blobs: set,
-    batch_size: int,
+    batch_sizes: list,
 ) -> None:
     """Upload updated JSONL + new blobs to the HF PR.  Never deletes existing files."""
     from huggingface_hub import CommitOperationAdd, HfApi
@@ -280,7 +284,8 @@ def push_to_pr(
             repo_type=HF_REPO_TYPE,
             operations=batch,
             commit_message=(
-                f"Add {def_name} workloads (bs={batch_size}, " f"part {i // HF_BATCH_SIZE + 1})"
+                f"Add {def_name} workloads (bs={','.join(str(b) for b in batch_sizes)}, "
+                f"part {i // HF_BATCH_SIZE + 1})"
             ),
             revision=f"refs/pr/{pr_num}",
             num_threads=8,
@@ -384,29 +389,42 @@ def main():
     parser.add_argument(
         "--dump-base-dir",
         default="/tmp/fi_stream_dump",
-        help="Base dir for per-batch-size dump dirs (default: /tmp/fi_stream_dump)",
+        help="Base dir for the dump dir (default: /tmp/fi_stream_dump)",
     )
     parser.add_argument(
         "--dump-count",
         type=int,
-        default=500,
-        help="FLASHINFER_DUMP_MAX_COUNT per server session (default: 500)",
+        default=50,
+        help=(
+            "FLASHINFER_DUMP_MAX_COUNT (default: 50). With dedup mode each "
+            "(batch_size, kv_length) shape signature is capped, so a small "
+            "budget covers all batch sizes in one server session."
+        ),
+    )
+    parser.add_argument(
+        "--dump-max-per-key",
+        type=int,
+        default=2,
+        help=(
+            "FLASHINFER_DUMP_MAX_PER_KEY: dumps retained per unique input "
+            "shape signature (default: 2)"
+        ),
     )
     parser.add_argument(
         "--workloads-per-batch",
         type=int,
         default=4,
-        help="Max new workloads to select per batch size (default: 4)",
+        help=(
+            "Max new workloads to select per batch size; the sanitizer is "
+            "called once over the combined dump dir with limit "
+            "workloads_per_batch * len(batch_sizes) (default: 4)"
+        ),
     )
     parser.add_argument(
         "--num-batches",
         type=int,
-        default=2,
-        help=(
-            "Inference rounds per batch size (default: 2). "
-            "The dump budget is typically hit in round 1; "
-            "round 2 adds a small safety margin."
-        ),
+        default=1,
+        help="Inference rounds across batch sizes (default: 1)",
     )
     parser.add_argument(
         "--base-url",
@@ -449,9 +467,9 @@ def main():
         ),
     )
     parser.add_argument(
-        "--replace-first",
+        "--replace",
         action="store_true",
-        help="Replace (not append) existing workloads when processing the first batch size",
+        help="Replace (not append) existing workloads",
     )
     parser.add_argument(
         "--no-eval",
@@ -475,84 +493,75 @@ def main():
     include_pattern = args.include_pattern or get_include_pattern(defn)
     blob_dir = trace_dir / "blob" / "workloads" / op_type / args.def_name
 
+    total_workloads = args.workloads_per_batch * len(args.batch_sizes)
     log(f"Definition:    {args.def_name}")
     log(f"Op type:       {op_type}")
     log(f"Include:       {include_pattern}")
     log(f"Batch sizes:   {args.batch_sizes}")
-    log(f"Dump limit:    {args.dump_count}")
-    log(f"Workloads/BS:  {args.workloads_per_batch}")
+    log(f"Dump limit:    {args.dump_count} (dedup max-per-key={args.dump_max_per_key})")
+    log(f"Workloads:     {total_workloads} ({args.workloads_per_batch} × {len(args.batch_sizes)} batch sizes)")
     log(f"Num batches:   {args.num_batches}")
     log(f"HF PR:         #{args.pr_num}")
     log(f"Dry run:       {args.no_push}")
 
-    # -----------------------------------------------------------------------
-    # Per-batch-size loop
-    # -----------------------------------------------------------------------
-    for i, batch_size in enumerate(args.batch_sizes):
-        log(f"\n{'=' * 60}")
-        log(f"Batch size {batch_size}  ({i + 1}/{len(args.batch_sizes)})")
+    dump_dir = dump_base_dir / args.def_name
+    dump_dir.mkdir(parents=True, exist_ok=True)
+
+    old_blobs = snapshot_blobs(blob_dir)
+
+    # --- Step 1: inference (single server session over all batch sizes) ---
+    log(f"\n{'=' * 60}")
+    log("Step 1: inference")
+    log(f"{'=' * 60}")
+    run_inference(
+        def_name=args.def_name,
+        model_key=args.model_key,
+        model_path=args.model_path,
+        batch_sizes=args.batch_sizes,
+        dump_dir=dump_dir,
+        include_pattern=include_pattern,
+        num_batches=args.num_batches,
+        dump_max_count=args.dump_count,
+        dump_max_per_key=args.dump_max_per_key,
+        extra_server_flags=extra_server_flags,
+        peer_node_addr=args.peer_node_addr or [],
+        dist_init_port=args.dist_init_port,
+        conda_env=args.conda_env,
+        base_url=args.base_url,
+    )
+
+    # --- Step 2: sanitize ---
+    log(f"\n{'=' * 60}")
+    log("Step 2: sanitize")
+    log(f"{'=' * 60}")
+    run_sanitize(dump_dir, args.def_name, trace_dir, total_workloads, args.replace)
+
+    jsonl_path = trace_dir / "workloads" / op_type / f"{args.def_name}.jsonl"
+    n_total = 0
+    if jsonl_path.exists():
+        n_total = sum(1 for l in jsonl_path.read_text().splitlines() if l.strip())
+    if n_total == 0:
+        raise RuntimeError(
+            f"0 workloads after sanitize — "
+            "check FLASHINFER_DUMP_INCLUDE, plan() capture, and const-axis check"
+        )
+    log(f"  Workloads in JSONL: {n_total}")
+
+    # --- Step 3: push ---
+    log(f"\n{'=' * 60}")
+    if not args.no_push:
+        log("Step 3: push to HF PR")
+        log(f"{'=' * 60}")
+        push_to_pr(
+            args.pr_num, args.def_name, op_type, trace_dir, blob_dir, old_blobs, args.batch_sizes
+        )
+    else:
+        log("Step 3: skipped (--no-push)")
         log(f"{'=' * 60}")
 
-        dump_dir = dump_base_dir / f"bs{batch_size}"
-        dump_dir.mkdir(parents=True, exist_ok=True)
-
-        # Snapshot blobs before sanitize so we know which are new after
-        old_blobs = snapshot_blobs(blob_dir)
-
-        # --- Step 1: inference ---
-        log("Step 1: inference")
-        run_inference(
-            def_name=args.def_name,
-            model_key=args.model_key,
-            model_path=args.model_path,
-            batch_size=batch_size,
-            dump_dir=dump_dir,
-            include_pattern=include_pattern,
-            num_batches=args.num_batches,
-            dump_max_count=args.dump_count,
-            extra_server_flags=extra_server_flags,
-            peer_node_addr=args.peer_node_addr or [],
-            dist_init_port=args.dist_init_port,
-            conda_env=args.conda_env,
-            base_url=args.base_url,
-        )
-
-        # --- Step 2: sanitize ---
-        log("Step 2: sanitize")
-        replace = args.replace_first and i == 0
-        run_sanitize(dump_dir, args.def_name, trace_dir, args.workloads_per_batch, replace)
-
-        # Verify we got something
-        jsonl_path = trace_dir / "workloads" / op_type / f"{args.def_name}.jsonl"
-        n_total = 0
-        if jsonl_path.exists():
-            n_total = sum(1 for l in jsonl_path.read_text().splitlines() if l.strip())
-        if n_total == 0:
-            raise RuntimeError(
-                f"0 workloads after sanitize for batch_size={batch_size} — "
-                "check FLASHINFER_DUMP_INCLUDE, plan() capture, and const-axis check"
-            )
-        log(f"  Workloads in JSONL so far: {n_total}")
-
-        # --- Step 3: push ---
-        if not args.no_push:
-            log("Step 3: push to HF PR")
-            push_to_pr(
-                args.pr_num, args.def_name, op_type, trace_dir, blob_dir, old_blobs, batch_size
-            )
-        else:
-            log("Step 3: skipped (--no-push)")
-
-        # --- Step 4: clear dump dir ---
-        log(f"Step 4: clearing {dump_dir}")
-        shutil.rmtree(dump_dir)
-
-    # -----------------------------------------------------------------------
-    # Post-collection: eval + trace upload
-    # -----------------------------------------------------------------------
-    log(f"\n{'=' * 60}")
-    log(f"Collection complete. Total batch sizes processed: {len(args.batch_sizes)}")
-    log(f"{'=' * 60}")
+    # --- Step 4: clear dump dir ---
+    log(f"Step 4: clearing {dump_dir}")
+    shutil.rmtree(dump_dir)
 
     if args.no_eval:
         log("Eval skipped (--no-eval). Done.")

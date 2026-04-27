@@ -13,11 +13,11 @@ Collect real-world workloads by running SGLang inference with FlashInfer Level 1
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/collect_stream.py` | **Preferred** end-to-end streaming script: per-batch-size inference → sanitize → incremental HF push → eval → trace upload |
-| `scripts/collect_workloads.py` | Older entry point: runs SGLang inference + sanitizes dumps (collects all batch sizes then pushes once) |
-| `scripts/sanitize_dumps.py` | Converts FlashInfer Level 10 dump dirs → JSONL + safetensors; supports `--max-new-workloads N` for streaming mode |
+| `scripts/collect_stream.py` | **Preferred** end-to-end script: single inference run over all batch sizes → sanitize → HF push → eval → trace upload |
+| `scripts/collect_workloads.py` | Older entry point: runs SGLang inference + sanitizes dumps |
+| `scripts/sanitize_dumps.py` | Converts FlashInfer Level 10 dump dirs → JSONL + safetensors; supports `--max-new-workloads N` |
 
-### Streaming collection (preferred)
+### Collection (preferred)
 
 ```bash
 # Must run under gpu-lock so CUDA_VISIBLE_DEVICES is set
@@ -52,21 +52,20 @@ tools/gpu-lock --gpus 8 --exec-timeout 10800 -- \
     --extra-server-flag --disable-cuda-graph --enable-deterministic-inference
 ```
 
-**Streaming workflow per batch size:**
-1. `bench_sharegpt.py` with `DUMP_MAX_COUNT=500` (exhausted in round 1 of 2)
-2. `sanitize_dumps.py --max-new-workloads 4` — appends 4 diverse workloads
-3. Incremental HF push: updated JSONL + new blobs (no deletes)
-4. `rm -rf` dump dir
-
-After all batch sizes: `flashinfer-bench run` eval → push trace → PR2 done.
+**Workflow:**
+1. `bench_sharegpt.py` runs once across all `--batch-sizes` against a single SGLang server. `FLASHINFER_DUMP_DEDUP=1` caps dumps to ~2 per unique `(batch_size, kv_length)` shape signature, so a small `DUMP_MAX_COUNT` budget covers every batch size without per-batch-size server restart.
+2. `sanitize_dumps.py --max-new-workloads N` runs once over the combined dump dir (N = `workloads_per_batch * len(batch_sizes)`).
+3. HF push: updated JSONL + new blobs (no deletes).
+4. `flashinfer-bench run` eval → push trace → PR2 done.
 
 **Key flags:**
-- `--dump-count 500` (default) — budget per server session
-- `--workloads-per-batch 4` (default) — workloads added per batch size
-- `--num-batches 2` (default) — inference rounds; budget typically hit in round 1
+- `--dump-count 50` (default) — `FLASHINFER_DUMP_MAX_COUNT`; small because dedup eliminates per-layer duplication
+- `--dump-max-per-key 2` (default) — `FLASHINFER_DUMP_MAX_PER_KEY`; cap per unique input shape signature
+- `--workloads-per-batch 4` (default) — workload budget per batch size; total cap is multiplied by `len(batch_sizes)`
+- `--num-batches 1` (default) — inference rounds; one round suffices under dedup
 - `--no-eval` — skip eval+trace push (useful when flashinfer-bench is unavailable)
 - `--no-push` — dry run: collect and sanitize without uploading
-- `--replace-first` — replace instead of append on first batch size
+- `--replace` — replace instead of append
 
 **Auto-detection from definition tags:**
 - `tp:N` → sets `--tp N` (use `CUDA_VISIBLE_DEVICES=0,0` to simulate TP=2 on 1 GPU)
@@ -102,23 +101,25 @@ FLASHINFER_DUMP_DIR=./workload_dumps_<timestamp>
 FLASHINFER_DUMP_SAFETENSORS=1
 FLASHINFER_DUMP_INCLUDE=<fi_api patterns>   # only log matching API calls
 FLASHINFER_DUMP_EXCLUDE=*.__init__
-FLASHINFER_DUMP_MAX_COUNT=500              # ~4 batches × 16 layers × 8 TP ranks per session
+FLASHINFER_DUMP_DEDUP=1                    # cap dumps per shape signature
+FLASHINFER_DUMP_MAX_PER_KEY=2              # 2 dumps retained per unique shape
+FLASHINFER_DUMP_MAX_COUNT=50               # small budget; dedup eliminates per-layer noise
 FLASHINFER_DUMP_MAX_SIZE_GB=30
 ```
 
-**DUMP_MAX_COUNT sizing**: with `--restart-per-batch-size`, each server session independently counts toward DUMP_MAX_COUNT.  500 covers ~4 full forward passes for TP=8, 16-layer models (4 × 16 × 8 = 512 run() calls). Use 500 as the standard value when collecting per-batch-size.
+**Dedup mode (`FLASHINFER_DUMP_DEDUP=1`)**: a transformer forward pass calls each FlashInfer wrapper once per layer with identical axes — so the dumped structural tensors are identical across all layers within one forward. Dedup mode caps dumps to `FLASHINFER_DUMP_MAX_PER_KEY` (default 2) per unique input shape signature, and for wrapper-class APIs uses each `plan()` to arm the immediately-following `run()`/`forward()` so plan/run pairing is preserved. This cuts dump volume ~16× on a 16-layer model and lets one server session cover all batch sizes within a small `DUMP_MAX_COUNT`.
 
 ### Phase 3: SGLang Inference
 
 **Inference source**: real ShareGPT prompts (from `--dataset` path or downloaded from HuggingFace `anon8231489123/ShareGPT_Vicuna_unfiltered`). Falls back to synthetic prompts only if ShareGPT is unavailable.
 
-**Batch sizes**: `[8, 32, 64, 128]` — powers of 2 matching SGLang CUDA graph capture points, run 4 rounds each with fresh ShareGPT slices for natural KV-length diversity.
+**Batch sizes**: `[8, 32, 64, 128]` — powers of 2 matching SGLang CUDA graph capture points; one round under dedup is enough because diversity comes from distinct shapes, not repeated layers.
 
-**Per-batch-size isolation** (`--restart-per-batch-size`): pass this flag to `bench_sharegpt.py` when using `FLASHINFER_DUMP_MAX_COUNT`.  Without it, the first batch size exhausts the dump budget (DUMP_MAX_COUNT is a global counter per server process) and later batch sizes capture nothing.  With it, each batch size gets its own server session and therefore its own fresh counter.
-
-Standard collection invocation with isolation:
+Standard collection invocation:
 ```bash
-FLASHINFER_DUMP_MAX_COUNT=500 \
+FLASHINFER_DUMP_DEDUP=1 \
+FLASHINFER_DUMP_MAX_PER_KEY=2 \
+FLASHINFER_DUMP_MAX_COUNT=50 \
 FLASHINFER_DUMP_INCLUDE="BatchDecodeWithPagedKVCacheWrapper*" \
 FLASHINFER_DUMP_EXCLUDE="*.__init__" \
 ... \
@@ -126,10 +127,11 @@ python3 examples/sglang_bench/bench_sharegpt.py \
   --model <model-key> \
   --model-path /path/to/model \
   --batch-sizes 64 128 \
-  --num-batches 4 \
-  --restart-per-batch-size \
+  --num-batches 1 \
   --disable-cuda-graph
 ```
+
+`--restart-per-batch-size` is no longer needed: under dedup, the dump budget is naturally distributed across batch sizes by the per-shape cap rather than consumed by the first batch size.
 
 **Three execution modes** (chosen automatically based on definition type):
 

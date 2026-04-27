@@ -349,6 +349,8 @@ if __name__ == '__main__':
         "FLASHINFER_DUMP_EXCLUDE",
         "FLASHINFER_DUMP_MAX_COUNT",
         "FLASHINFER_DUMP_MAX_SIZE_GB",
+        "FLASHINFER_DUMP_DEDUP",
+        "FLASHINFER_DUMP_MAX_PER_KEY",
         "FLASHINFER_USE_CUDA_NORM",
     ]
     fi_env_json = json.dumps({k: env[k] for k in fi_env_keys if k in env})
@@ -572,6 +574,8 @@ if __name__ == '__main__':
         "FLASHINFER_DUMP_EXCLUDE",
         "FLASHINFER_DUMP_MAX_COUNT",
         "FLASHINFER_DUMP_MAX_SIZE_GB",
+        "FLASHINFER_DUMP_DEDUP",
+        "FLASHINFER_DUMP_MAX_PER_KEY",
         "FLASHINFER_USE_CUDA_NORM",
     ]
     fi_env_json = json.dumps({k: env[k] for k in fi_env_keys if k in env})
@@ -641,10 +645,11 @@ def run_sglang_mode(
     env["FLASHINFER_DUMP_INCLUDE"] = include_pattern
     # Exclude only constructors; .plan is included selectively via FLASHINFER_DUMP_INCLUDE
     env["FLASHINFER_DUMP_EXCLUDE"] = "*.__init__"
-    # Each batch-size round emits ~2 decode dumps per worker (1 plan + 1-8 run).
-    # Round count varies by schedule and can include larger-batch cases (up to 256).
-    # Keep a generous cap so high-concurrency runs do not truncate dumps.
-    env["FLASHINFER_DUMP_MAX_COUNT"] = "50000"
+    # Dedup mode caps dumps to MAX_PER_KEY per (batch_size, kv_length) shape
+    # signature so per-layer duplication on transformer forwards is eliminated.
+    env["FLASHINFER_DUMP_DEDUP"] = "1"
+    env["FLASHINFER_DUMP_MAX_PER_KEY"] = "2"
+    env["FLASHINFER_DUMP_MAX_COUNT"] = "1000"
     env["FLASHINFER_DUMP_MAX_SIZE_GB"] = "30"
     # Use pre-compiled CUDA norm kernels — CuTe DSL norm requires CUDA toolkit 13.1+
     env["FLASHINFER_USE_CUDA_NORM"] = "1"
